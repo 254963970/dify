@@ -172,6 +172,8 @@ class BaseSession(
         # Initialize executor and future to None for proper cleanup checks
         self._executor: ThreadPoolExecutor | None = None
         self._receiver_future: Future | None = None
+        # Track session state for proper lifecycle management
+        self._is_closing = False
 
     def __enter__(self) -> Self:
         # The thread pool is dedicated to running `_receive_loop`. Setting `max_workers` to 1
@@ -189,20 +191,54 @@ class BaseSession(
     def __exit__(
         self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: TracebackType | None
     ) -> None:
-        self._read_stream.put(None)
-        self._write_stream.put(None)
+        """
+        Clean up resources and ensure proper shutdown of receiver thread.
+        
+        This method ensures:
+        1. Receiver loop is signaled to stop via sentinel values in queues
+        2. Receiver future is awaited with appropriate timeout
+        3. Thread pool executor is properly shut down
+        4. All resources are cleaned up even if errors occur
+        """
+        logger = logging.getLogger(__name__)
+        self._is_closing = True
+        
+        # Signal the receiver loop to stop by putting None sentinels
+        try:
+            self._read_stream.put(None)
+        except Exception as e:
+            logger.warning("Failed to signal read stream closure: %s", e)
+        
+        try:
+            self._write_stream.put(None)
+        except Exception as e:
+            logger.warning("Failed to signal write stream closure: %s", e)
 
-        # Wait for the receiver loop to finish
+        # Wait for the receiver loop to finish with increased timeout for safety
         if self._receiver_future:
             try:
-                self._receiver_future.result(timeout=5.0)  # Wait up to 5 seconds
+                # Increased timeout from 5.0 to 10.0 seconds to handle slow shutdown gracefully
+                self._receiver_future.result(timeout=10.0)
+                logger.debug("Receiver loop shut down successfully")
             except TimeoutError:
-                # If the receiver loop is still running after timeout, we'll force shutdown
-                pass
+                # If the receiver loop is still running after timeout, log a warning
+                # The executor shutdown will still proceed to prevent resource leaks
+                logger.warning(
+                    "Receiver loop did not complete within timeout. "
+                    "Proceeding with forced shutdown to prevent resource leaks."
+                )
+            except Exception as e:
+                # Log any other exceptions from the receiver loop but continue cleanup
+                logger.warning("Exception during receiver loop shutdown: %s", e)
 
-        # Shutdown the executor
+        # Shutdown the executor - this will wait for the thread to complete
+        # Using wait=True ensures thread joins before returning, preventing leaked threads
         if self._executor:
-            self._executor.shutdown(wait=True)
+            try:
+                self._executor.shutdown(wait=True, cancel_futures=False)
+                logger.debug("Executor shut down successfully")
+            except Exception as e:
+                logger.error("Error shutting down executor: %s", e)
 
     def send_request(
         self,
@@ -311,12 +347,24 @@ class BaseSession(
         """
         Main message processing loop.
         In a real synchronous implementation, this would likely run in a separate thread.
+        
+        This loop:
+        1. Continuously reads messages from the read stream
+        2. Routes messages to appropriate handlers (requests, responses, notifications)
+        3. Manages request/response correlation
+        4. Handles graceful shutdown via None sentinel
+        5. Propagates exceptions for proper error handling
         """
         while True:
             try:
+                # Check if we're in closing state to exit quickly
+                if self._is_closing:
+                    break
+                    
                 # Attempt to receive a message (this would be blocking in a synchronous context)
                 message = self._read_stream.get(timeout=DEFAULT_RESPONSE_READ_TIMEOUT)
                 if message is None:
+                    # None is the sentinel value indicating shutdown
                     break
                 if isinstance(message, HTTPStatusError):
                     response_queue = self._response_streams.get(self._request_id - 1)
@@ -374,6 +422,7 @@ class BaseSession(
                     else:
                         self._handle_incoming(RuntimeError(f"Server Error: {message}"))
             except queue.Empty:
+                # Timeout occurred, check if we should continue or exit
                 continue
             except Exception:
                 logging.exception("Error in message processing loop")

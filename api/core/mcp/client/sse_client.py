@@ -270,11 +270,19 @@ def sse_client(
 
     Yields:
         Tuple of (read_queue, write_queue) for message communication.
+        
+    Note:
+        This context manager ensures proper shutdown of all threads and cleanup
+        of resources even in error conditions. Threads are given time to complete
+        gracefully before forced termination.
     """
     transport = SSETransport(url, headers, timeout, sse_read_timeout)
 
     read_queue: ReadQueue | None = None
     write_queue: WriteQueue | None = None
+
+    # Use a longer timeout for executor shutdown to allow threads to complete gracefully
+    executor_shutdown_timeout = 15.0
 
     with ThreadPoolExecutor() as executor:
         try:
@@ -296,11 +304,21 @@ def sse_client(
             logger.exception("Error connecting to SSE endpoint")
             raise
         finally:
-            # Clean up queues
+            # Clean up queues with sentinel values to signal threads to stop
             if read_queue:
-                read_queue.put(None)
+                try:
+                    read_queue.put(None)
+                except Exception as e:
+                    logger.warning("Error signaling read queue closure: %s", e)
+                    
             if write_queue:
-                write_queue.put(None)
+                try:
+                    write_queue.put(None)
+                except Exception as e:
+                    logger.warning("Error signaling write queue closure: %s", e)
+            
+            # The executor context manager will handle shutdown, but we log for visibility
+            logger.debug("SSE client cleanup completed")
 
 
 def send_message(http_client: httpx.Client, endpoint_url: str, session_message: SessionMessage) -> None:

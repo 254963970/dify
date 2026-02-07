@@ -423,6 +423,13 @@ def streamablehttp_client(
             - server_to_client_queue: Queue for reading messages FROM the server
             - client_to_server_queue: Queue for sending messages TO the server
             - get_session_id_callback: Function to retrieve the current session ID
+            
+    Note:
+        This context manager ensures:
+        1. Proper session termination if requested (terminate_on_close=True)
+        2. All threads are signaled to stop via None sentinels
+        3. Queues are properly cleaned up to avoid blocking threads
+        4. Thread pool executor shuts down gracefully
     """
     transport = StreamableHTTPTransport(url, headers, timeout, sse_read_timeout)
 
@@ -457,18 +464,38 @@ def streamablehttp_client(
                         transport.get_session_id,
                     )
                 finally:
+                    # Terminate session first if requested, before signaling threads
                     if transport.session_id and terminate_on_close:
-                        transport.terminate_session(client)
+                        try:
+                            transport.terminate_session(client)
+                        except Exception as e:
+                            logger.warning("Error terminating session: %s", e)
 
-                    # Signal threads to stop
-                    client_to_server_queue.put(None)
+                    # Signal threads to stop by sending None sentinel
+                    try:
+                        client_to_server_queue.put(None)
+                    except Exception as e:
+                        logger.warning("Error signaling client_to_server_queue closure: %s", e)
         finally:
             # Clear any remaining items and add None sentinel to unblock any waiting threads
+            # This is a safety measure to ensure threads don't block indefinitely
             try:
                 while not client_to_server_queue.empty():
                     client_to_server_queue.get_nowait()
             except queue.Empty:
                 pass
+            except Exception as e:
+                logger.warning("Error clearing client_to_server_queue: %s", e)
 
-            client_to_server_queue.put(None)
-            server_to_client_queue.put(None)
+            # Put None sentinels to ensure threads can exit
+            try:
+                client_to_server_queue.put(None)
+            except Exception as e:
+                logger.warning("Error putting None to client_to_server_queue: %s", e)
+                
+            try:
+                server_to_client_queue.put(None)
+            except Exception as e:
+                logger.warning("Error putting None to server_to_client_queue: %s", e)
+            
+            logger.debug("StreamableHTTP client cleanup completed")
